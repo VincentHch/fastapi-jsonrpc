@@ -148,6 +148,14 @@ class BaseError(Exception):
 
     _component_name = None
 
+    # In some case, we want to return an error to the client without logging at an
+    # error level. Custom level can be specified in the log_level attribute
+    log_level = logging.ERROR
+
+    # BaseError can also have a 'should_log_exc_info' attribute
+    # default value is True
+    should_log_exc_info = True
+
     def __init__(self, data=None):
         if data is None:
             data = {}
@@ -559,7 +567,7 @@ class JsonRpcContext:
         self.exit_stack = await AsyncExitStack().__aenter__()
         if sentry_sdk is not None:
             self.exit_stack.enter_context(self._fix_sentry_scope())
-        await self.exit_stack.enter_async_context(self._handle_exception(reraise=False))
+        await self.exit_stack.enter_async_context(self._handle_exception(request=self.raw_request, reraise=False))
         self.jsonrpc_context_token = _jsonrpc_context.set(self)
         return self
 
@@ -569,14 +577,14 @@ class JsonRpcContext:
         return await self.exit_stack.__aexit__(*exc_details)
 
     @asynccontextmanager
-    async def _handle_exception(self, reraise=True):
+    async def _handle_exception(self, request: Any, reraise=True):
         try:
             yield
         except Exception as exc:
             if exc is not self.exception:
                 try:
                     resp, is_unhandled_exception = await self.entrypoint.handle_exception_to_resp(
-                        exc, log_unhandled_exception=False,
+                        exc, request, log_unhandled_exception=False,
                     )
                 except Exception as exc:
                     # HTTPException
@@ -588,8 +596,8 @@ class JsonRpcContext:
             if reraise:
                 raise
 
-        if self.exception is not None and self.is_unhandled_exception:
-            logger.exception(str(self.exception), exc_info=self.exception)
+        # if self.exception is not None and self.is_unhandled_exception:
+        #     logger.exception(str(self.exception), exc_info=self.exception)
 
     def _make_sentry_event_processor(self):
         def event_processor(event, _):
@@ -1216,13 +1224,32 @@ class Entrypoint(APIRouter):
         self.scheduler = await self.scheduler_factory(**(self.scheduler_kwargs or {}))
         return self.scheduler
 
-    async def handle_exception(self, exc):
+    # Add a log statement if any error is raised.
+    async def handle_exception(self, exc, request: Any):
+
+        if isinstance(exc, BaseError):
+            logging.log(
+                exc.log_level,
+                exc,
+                # exc_info set to False still log traceback. It must be set to None to avoid it.
+                exc_info=True if exc.should_log_exc_info else None,
+                extra={'request': request}
+            )
+
+        else:
+            logger.exception(
+                str(exc),
+                exc_info=True,
+                extra={'request': request}
+            )
+
         raise exc
 
-    async def handle_exception_to_resp(self, exc, log_unhandled_exception=True) -> Tuple[dict, bool]:
+
+    async def handle_exception_to_resp(self, exc, request: Any, log_unhandled_exception=True) -> Tuple[dict, bool]:
         is_unhandled_exception = False
         try:
-            resp = await self.handle_exception(exc)
+            resp = await self.handle_exception(exc, request)
         except BaseError as error:
             resp = error.get_resp()
         except HTTPException:
