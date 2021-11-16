@@ -153,8 +153,8 @@ class BaseError(Exception):
     log_level = logging.ERROR
 
     # BaseError can also have a 'should_log_exc_info' attribute
-    # default value is True
-    should_log_exc_info = True
+    # default value is False
+    should_log_exc_info = False
 
     def __init__(self, data=None):
         if data is None:
@@ -177,8 +177,8 @@ class BaseError(Exception):
 
     def __str__(self):
         s = f"[{self.CODE}] {self.MESSAGE}"
-        if self.data:
-            s += f": {self.data!r}"
+        # if self.data:
+        #     s += f": {self.data!r}"
         return s
 
     def get_resp_data(self):
@@ -337,6 +337,7 @@ class InternalError(BaseError):
     """Internal JSON-RPC error"""
     CODE = -32603
     MESSAGE = "Internal error"
+    should_log_exc_info = True
 
 
 class NoContent(Exception):
@@ -1225,22 +1226,23 @@ class Entrypoint(APIRouter):
         return self.scheduler
 
     # Add a log statement if any error is raised.
-    async def handle_exception(self, exc, request: Any):
+    async def handle_exception(self, exc, request: Any = None):
 
         if isinstance(exc, BaseError):
-            logging.log(
+            logger.log(
                 exc.log_level,
                 exc,
                 # exc_info set to False still log traceback. It must be set to None to avoid it.
                 exc_info=True if exc.should_log_exc_info else None,
-                extra={'request': request}
+                extra={'request': request, 'error': exc.get_resp()}
             )
 
         else:
-            logger.exception(
-                str(exc),
+            logger.log(
+                InternalError.log_level,
+                exc.__class__.__name__ + ": " + str(exc),
                 exc_info=True,
-                extra={'request': request}
+                extra={'request': request, 'error': exc.get_resp()}
             )
 
         raise exc
