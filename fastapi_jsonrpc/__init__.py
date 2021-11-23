@@ -1,3 +1,6 @@
+# flake8: noqa
+# type: ignore
+
 import asyncio
 import contextvars
 import inspect
@@ -1227,14 +1230,13 @@ class Entrypoint(APIRouter):
 
     # Add a log statement if any error is raised.
     async def handle_exception(self, exc, request: Any = None):
-
         if isinstance(exc, BaseError):
             logger.log(
                 exc.log_level,
                 exc,
                 # exc_info set to False still log traceback. It must be set to None to avoid it.
                 exc_info=True if exc.should_log_exc_info else None,
-                extra={'request': request, 'error': exc.get_resp()}
+                extra={'request': request, 'error_returned': exc.get_resp()}
             )
 
         else:
@@ -1242,13 +1244,13 @@ class Entrypoint(APIRouter):
                 InternalError.log_level,
                 exc.__class__.__name__ + ": " + str(exc),
                 exc_info=True,
-                extra={'request': request, 'error': exc.get_resp()}
+                extra={'request': request}
             )
 
         raise exc
 
 
-    async def handle_exception_to_resp(self, exc, request: Any, log_unhandled_exception=True) -> Tuple[dict, bool]:
+    async def handle_exception_to_resp(self, exc, request: Any = None, log_unhandled_exception=True) -> Tuple[dict, bool]:
         is_unhandled_exception = False
         try:
             resp = await self.handle_exception(exc, request)
