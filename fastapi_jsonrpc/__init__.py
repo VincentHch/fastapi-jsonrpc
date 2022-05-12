@@ -2,23 +2,22 @@
 # type: ignore
 
 import asyncio
-import contextvars
+import contextvars  # noqa
 import inspect
 import logging
 import typing
 from collections import ChainMap
+from collections.abc import Coroutine
 from contextlib import AsyncExitStack, AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from json import JSONDecodeError
-from types import FunctionType, CoroutineType
-from typing import List, Union, Any, Callable, Type, Optional, Dict, Sequence, Awaitable, Tuple
+from types import FunctionType
+from typing import List, Union, Any, Callable, Type, Optional, Dict, Sequence, Awaitable
 
-# noinspection PyProtectedMember
-from pydantic import DictError
+from pydantic import DictError  # noqa
 from pydantic import StrictStr, ValidationError
 from pydantic import BaseModel, BaseConfig
-from pydantic.fields import ModelField, Field
-# noinspection PyProtectedMember
-from pydantic.main import ModelMetaclass
+from pydantic.fields import ModelField, Field, Undefined
+from pydantic.main import ModelMetaclass  # noqa
 from fastapi.dependencies.models import Dependant
 from fastapi.encoders import jsonable_encoder
 from fastapi.params import Depends
@@ -76,6 +75,8 @@ class Params(fastapi.params.Body):
         min_length: int = None,
         max_length: int = None,
         regex: str = None,
+        example: Any = Undefined,
+        examples: Optional[Dict[str, Any]] = None,
         **extra: Any,
     ):
         super().__init__(
@@ -92,6 +93,8 @@ class Params(fastapi.params.Body):
             min_length=min_length,
             max_length=max_length,
             regex=regex,
+            example=example,
+            examples=examples,
             **extra,
         )
 
@@ -198,7 +201,7 @@ class BaseError(Exception):
     def get_default_description(cls):
         return f"[{cls.CODE}] {cls.MESSAGE}"
 
-    def get_resp(self):
+    def get_resp(self) -> dict:
         error = {
             'code': self.CODE,
             'message': self.MESSAGE,
@@ -477,6 +480,9 @@ def make_request_model(name, module, body_params: List[ModelField]):
         _JsonRpcRequestParams = ModelMetaclass.__new__(ModelMetaclass, '_JsonRpcRequestParams', (BaseModel,), {})
 
         for f in body_params:
+            example = f.field_info.example  # noqa
+            if example is not Undefined:
+                f.field_info.extra['example'] = jsonable_encoder(example)
             _JsonRpcRequestParams.__fields__[f.name] = f
 
         _JsonRpcRequestParams = component_name(f'_Params[{name}]', module)(_JsonRpcRequestParams)
@@ -532,15 +538,28 @@ class JsonRpcContext:
 
     def on_raw_response(
         self,
-        raw_response: dict,
-        exception: Optional[Exception] = None,
-        is_unhandled_exception: bool = False,
+        raw_response: Union[dict, Exception],
     ):
-        raw_response.pop('id', None)
-        if isinstance(self.raw_request, dict) and 'id' in self.raw_request:
-            raw_response['id'] = self.raw_request.get('id')
-        elif 'error' in raw_response:
-            raw_response['id'] = None
+        exception = None
+        is_unhandled_exception = False
+
+        if isinstance(raw_response, Exception):
+            exception = raw_response
+            if isinstance(exception, BaseError):
+                raw_response = exception.get_resp()
+            elif isinstance(exception, HTTPException):
+                raw_response = None
+            else:
+                raw_response = InternalError().get_resp()
+                is_unhandled_exception = True
+
+        if raw_response is not None:
+            raw_response.pop('id', None)
+            if isinstance(self.raw_request, dict) and 'id' in self.raw_request:
+                raw_response['id'] = self.raw_request.get('id')
+            elif 'error' in raw_response:
+                raw_response['id'] = None
+
         self._raw_response = raw_response
         self.exception = exception
         self.is_unhandled_exception = is_unhandled_exception
@@ -584,21 +603,16 @@ class JsonRpcContext:
     async def _handle_exception(self, request: Any, reraise=True):
         try:
             yield
-        except Exception as exc:
-            if exc is not self.exception:
+        except Exception as exception:
+            if exception is not self.exception:
                 try:
-                    resp, is_unhandled_exception = await self.entrypoint.handle_exception_to_resp(
-                        exc, request, log_unhandled_exception=False,
-                    )
+                    resp = await self.entrypoint.handle_exception(exception)
                 except Exception as exc:
-                    # HTTPException
-                    self._raw_response = None
-                    self.exception = exc
-                    self.is_unhandled_exception = True
-                    raise
-                self.on_raw_response(resp, exc, is_unhandled_exception)
-            if reraise:
-                raise
+                    self.on_raw_response(exc)
+                else:
+                    self.on_raw_response(resp)
+            if self.exception is not None and (reraise or isinstance(self.exception, HTTPException)):
+                raise self.exception
 
         # if self.exception is not None and self.is_unhandled_exception:
         #     logger.exception(str(self.exception), exc_info=self.exception)
@@ -652,11 +666,11 @@ class MethodRoute(APIRoute):
         self,
         entrypoint: 'Entrypoint',
         path: str,
-        func: Union[FunctionType, CoroutineType],
+        func: Union[FunctionType, Coroutine],
         *,
         result_model: Type[Any] = None,
         name: str = None,
-        errors: Sequence[Type[BaseError]] = None,
+        errors: List[Type[BaseError]] = None,
         dependencies: Sequence[Depends] = None,
         response_class: Type[Response] = JSONResponse,
         request_class: Type[JsonRpcRequest] = JsonRpcRequest,
@@ -717,6 +731,17 @@ class MethodRoute(APIRoute):
         self.middlewares = middlewares or []
         self.app = request_response(self.handle_http_request)
         self.request_class = request_class
+        self.errors = errors or []
+
+    def __hash__(self):
+        return hash(self.path)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, MethodRoute)
+            and self.path == other.path
+            and self.func == other.func
+        )
 
     async def parse_body(self, http_request) -> Any:
         try:
@@ -740,7 +765,7 @@ class MethodRoute(APIRoute):
         try:
             body = await self.parse_body(http_request)
         except Exception as exc:
-            resp, _ = await self.entrypoint.handle_exception_to_resp(exc)
+            resp = await self.entrypoint.handle_exception_to_resp(exc)
             response = self.response_class(content=resp, background=background_tasks)
         else:
             try:
@@ -905,7 +930,7 @@ class EntrypointRoute(APIRoute):
         path: str,
         *,
         name: str = None,
-        errors: Sequence[Type[BaseError]] = None,
+        errors: List[Type[BaseError]] = None,
         common_dependencies: Sequence[Depends] = None,
         response_class: Type[Response] = JSONResponse,
         request_class: Type[JsonRpcRequest] = JsonRpcRequest,
@@ -974,6 +999,16 @@ class EntrypointRoute(APIRoute):
         self.entrypoint = entrypoint
         self.common_dependencies = common_dependencies
         self.request_class = request_class
+        self.errors = errors or []
+
+    def __hash__(self):
+        return hash(self.path)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, EntrypointRoute)
+            and self.path == other.path
+        )
 
     async def solve_shared_dependencies(
         self,
@@ -1025,7 +1060,7 @@ class EntrypointRoute(APIRoute):
         try:
             body = await self.parse_body(http_request)
         except Exception as exc:
-            resp, _ = await self.entrypoint.handle_exception_to_resp(exc)
+            resp = await self.entrypoint.handle_exception_to_resp(exc)
             response = self.response_class(content=resp, background=background_tasks)
         else:
             try:
@@ -1079,13 +1114,7 @@ class EntrypointRoute(APIRoute):
                         shared_dependencies_error=shared_dependencies_error,
                     )
                 )
-
-                # TODO: https://github.com/aio-libs/aiojobs/issues/119
-                job._explicit = True
-                # noinspection PyProtectedMember
-                coro = job._do_wait(timeout=None)
-
-                job_list.append(coro)
+                job_list.append(job.wait())
         else:
             req = req_list[0]
             coro = self.handle_req_to_resp(
@@ -1097,9 +1126,7 @@ class EntrypointRoute(APIRoute):
 
         resp_list = []
 
-        for coro in job_list:
-            resp = await coro
-
+        for resp in await asyncio.gather(*job_list):
             # No response for successful notifications
             has_content = 'error' in resp or 'id' in resp
             if not has_content:
@@ -1175,7 +1202,7 @@ class Entrypoint(APIRouter):
     method_route_class = MethodRoute
     entrypoint_route_class = EntrypointRoute
 
-    default_errors: Sequence[Type[BaseError]] = [
+    default_errors: List[Type[BaseError]] = [
         InvalidParams, MethodNotFound, ParseError, InvalidRequest, InternalError,
     ]
 
@@ -1184,7 +1211,7 @@ class Entrypoint(APIRouter):
         path: str,
         *,
         name: str = None,
-        errors: Sequence[Type[BaseError]] = None,
+        errors: List[Type[BaseError]] = None,
         dependencies: Sequence[Depends] = None,
         common_dependencies: Sequence[Depends] = None,
         middlewares: Sequence[JsonRpcMiddleware] = None,
@@ -1195,7 +1222,7 @@ class Entrypoint(APIRouter):
     ) -> None:
         super().__init__(redirect_slashes=False)
         if errors is None:
-            errors = self.default_errors
+            errors = list(self.default_errors)
         self.middlewares = middlewares or []
         self.scheduler_factory = scheduler_factory
         self.scheduler_kwargs = scheduler_kwargs
@@ -1214,6 +1241,15 @@ class Entrypoint(APIRouter):
         )
         self.routes.append(self.entrypoint_route)
 
+    def __hash__(self):
+        return hash(self.entrypoint_route.path)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Entrypoint)
+            and self.routes == other.routes
+        )
+
     @property
     def common_dependencies(self):
         return self.entrypoint_route.common_dependencies
@@ -1228,30 +1264,10 @@ class Entrypoint(APIRouter):
         self.scheduler = await self.scheduler_factory(**(self.scheduler_kwargs or {}))
         return self.scheduler
 
-    # Add a log statement if any error is raised.
-    async def handle_exception(self, exc, request: Any = None):
-        if isinstance(exc, BaseError):
-            logger.log(
-                exc.log_level,
-                exc,
-                # exc_info set to False still log traceback. It must be set to None to avoid it.
-                exc_info=True if exc.should_log_exc_info else None,
-                extra={'request': request, 'error_returned': exc.get_resp()}
-            )
-
-        else:
-            logger.log(
-                InternalError.log_level,
-                exc.__class__.__name__ + ": " + str(exc),
-                exc_info=True,
-                extra={'request': request}
-            )
-
+    async def handle_exception(self, exc) -> dict:
         raise exc
 
-
-    async def handle_exception_to_resp(self, exc, request: Any = None, log_unhandled_exception=True) -> Tuple[dict, bool]:
-        is_unhandled_exception = False
+    async def handle_exception_to_resp(self, exc) -> dict:
         try:
             resp = await self.handle_exception(exc, request)
         except BaseError as error:
@@ -1259,11 +1275,9 @@ class Entrypoint(APIRouter):
         except HTTPException:
             raise
         except Exception as exc:
-            if log_unhandled_exception:
-                logger.exception(str(exc), exc_info=exc)
+            logger.exception(str(exc), exc_info=exc)
             resp = InternalError().get_resp()
-            is_unhandled_exception = True
-        return resp, is_unhandled_exception
+        return resp
 
     def bind_dependency_overrides_provider(self, value):
         for route in self.routes:
@@ -1283,7 +1297,7 @@ class Entrypoint(APIRouter):
 
     def add_method_route(
         self,
-        func: FunctionType,
+        func: Union[FunctionType, Coroutine],
         *,
         name: str = None,
         **kwargs,
@@ -1303,7 +1317,7 @@ class Entrypoint(APIRouter):
         self,
         **kwargs,
     ) -> Callable:
-        def decorator(func: FunctionType) -> Callable:
+        def decorator(func: Union[FunctionType, Coroutine]) -> Callable:
             self.add_method_route(
                 func,
                 **kwargs,
@@ -1357,4 +1371,4 @@ if __name__ == '__main__':
 
     app.bind_entrypoint(api_v1)
 
-    uvicorn.run(app, port=5000, debug=True, access_log=False)
+    uvicorn.run(app, port=5000, debug=True, access_log=False)  # noqa
